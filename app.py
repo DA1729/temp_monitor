@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Enhanced CPU Temperature Monitor with Claude.ai-like UI
-Reads from Linux thermal zones and serves temperature data via REST API
-"""
 
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
