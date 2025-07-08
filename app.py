@@ -16,8 +16,10 @@ CORS(app)  # Enable CORS for cross-origin requests
 class ThermalMonitor:
     def __init__(self):
         self.thermal_zones = []
+        self.fan_sensors = []
         self.temperature_history = deque(maxlen=100)
         self.current_temps = {}
+        self.current_fans = {}
         self.stats = {
             'avg_temp': 0,
             'max_temp': 0,
@@ -25,6 +27,7 @@ class ThermalMonitor:
             'cpu_temp': 0
         }
         self.discover_thermal_zones()
+        self.discover_fan_sensors()
         self.start_monitoring()
     
     def discover_thermal_zones(self):
@@ -55,6 +58,76 @@ class ThermalMonitor:
         print(f"Discovered {len(self.thermal_zones)} thermal zones:")
         for zone in self.thermal_zones:
             print(f"  - {zone['name']}: {zone['path']}")
+    
+    def discover_fan_sensors(self):
+        """Discover available fan sensors"""
+        fan_sensors = []
+        
+        # Search through all hwmon directories
+        hwmon_pattern = '/sys/class/hwmon/hwmon*'
+        hwmon_dirs = glob.glob(hwmon_pattern)
+        
+        for hwmon_dir in hwmon_dirs:
+            try:
+                # Get the device name
+                name_file = os.path.join(hwmon_dir, 'name')
+                device_name = 'unknown'
+                try:
+                    with open(name_file, 'r') as f:
+                        device_name = f.read().strip()
+                except:
+                    pass
+                
+                # Look for fan input files
+                fan_pattern = os.path.join(hwmon_dir, 'fan*_input')
+                fan_files = glob.glob(fan_pattern)
+                
+                for fan_file in fan_files:
+                    fan_num = fan_file.split('fan')[1].split('_')[0]
+                    
+                    # Try to read the fan label
+                    label_file = os.path.join(hwmon_dir, f'fan{fan_num}_label')
+                    fan_label = f'Fan {fan_num}'
+                    try:
+                        with open(label_file, 'r') as f:
+                            fan_label = f.read().strip()
+                    except:
+                        pass
+                    
+                    # Test if we can read the fan speed
+                    try:
+                        with open(fan_file, 'r') as f:
+                            speed = int(f.read().strip())
+                            if speed >= 0:  # Valid fan speed
+                                fan_sensors.append({
+                                    'id': f"{device_name}_{fan_num}",
+                                    'path': fan_file,
+                                    'label': fan_label,
+                                    'device': device_name,
+                                    'fan_num': fan_num,
+                                    'name': f"{device_name} - {fan_label}"
+                                })
+                    except:
+                        pass
+                        
+            except Exception as e:
+                print(f"Error scanning {hwmon_dir}: {e}")
+        
+        self.fan_sensors = fan_sensors
+        print(f"Discovered {len(self.fan_sensors)} fan sensors:")
+        for fan in self.fan_sensors:
+            print(f"  - {fan['name']}: {fan['path']}")
+    
+    def read_fan_speed(self, fan_file):
+        """Read fan speed from a fan sensor file"""
+        try:
+            with open(fan_file, 'r') as f:
+                # Fan speed is in RPM
+                speed_rpm = int(f.read().strip())
+                return speed_rpm
+        except Exception as e:
+            print(f"Error reading {fan_file}: {e}")
+            return None
     
     def read_temperature(self, temp_file):
         """Read temperature from a thermal zone file"""
@@ -122,11 +195,28 @@ class ThermalMonitor:
                     self.stats['max_temp'] = max(recent_temps)
                     self.stats['min_temp'] = min(recent_temps)
     
+    def update_fans(self):
+        """Update all fan speed readings"""
+        fans = {}
+        
+        for fan in self.fan_sensors:
+            speed = self.read_fan_speed(fan['path'])
+            if speed is not None:
+                fans[fan['id']] = {
+                    'speed': speed,
+                    'label': fan['label'],
+                    'device': fan['device'],
+                    'name': fan['name']
+                }
+        
+        self.current_fans = fans
+    
     def start_monitoring(self):
-        """Start background temperature monitoring"""
+        """Start background temperature and fan monitoring"""
         def monitor_loop():
             while True:
                 self.update_temperatures()
+                self.update_fans()
                 time.sleep(1)  # Update every second
         
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
@@ -183,6 +273,25 @@ def get_zones():
     return jsonify({
         'zones': thermal_monitor.thermal_zones,
         'count': len(thermal_monitor.thermal_zones),
+        'timestamp': datetime.now().isoformat(),
+        'status': 'success'
+    })
+
+@app.route('/api/fans')
+def get_fans():
+    """Get current fan speeds"""
+    return jsonify({
+        'fans': thermal_monitor.current_fans,
+        'timestamp': datetime.now().isoformat(),
+        'status': 'success'
+    })
+
+@app.route('/api/fan-sensors')
+def get_fan_sensors():
+    """Get information about available fan sensors"""
+    return jsonify({
+        'sensors': thermal_monitor.fan_sensors,
+        'count': len(thermal_monitor.fan_sensors),
         'timestamp': datetime.now().isoformat(),
         'status': 'success'
     })
@@ -521,6 +630,11 @@ HTML_TEMPLATE = '''
                 <div id="zonesList"></div>
             </div>
 
+            <div class="card">
+                <div class="zones-title">Fan Speeds</div>
+                <div id="fansList"></div>
+            </div>
+
             <div id="errorDisplay" class="error"></div>
         </div>
 
@@ -594,6 +708,20 @@ HTML_TEMPLATE = '''
                     return data.zones;
                 } catch (error) {
                     console.error('Error reading all temperatures:', error);
+                    return null;
+                }
+            }
+
+            async readFanSpeeds() {
+                try {
+                    const response = await fetch(`${this.apiBase}/api/fans`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    const data = await response.json();
+                    return data.fans;
+                } catch (error) {
+                    console.error('Error reading fan speeds:', error);
                     return null;
                 }
             }
@@ -732,7 +860,7 @@ HTML_TEMPLATE = '''
                 this.chart.update();
             }
 
-            updateDisplay(temp, stats, allTemps) {
+            updateDisplay(temp, stats, allTemps, fanSpeeds) {
                 // Update main temperature display
                 const tempValue = document.getElementById('tempValue');
                 const statusBadge = document.getElementById('statusBadge');
@@ -788,6 +916,26 @@ HTML_TEMPLATE = '''
                         zonesList.appendChild(zoneItem);
                     });
                 }
+
+                // Update fan speeds
+                if (fanSpeeds) {
+                    const fansList = document.getElementById('fansList');
+                    fansList.innerHTML = '';
+                    
+                    if (Object.keys(fanSpeeds).length === 0) {
+                        fansList.innerHTML = '<div class="zone-item"><div class="zone-name">No fans detected</div></div>';
+                    } else {
+                        Object.values(fanSpeeds).forEach(fan => {
+                            const fanItem = document.createElement('div');
+                            fanItem.className = 'zone-item';
+                            fanItem.innerHTML = `
+                                <div class="zone-name">${fan.label || fan.device}</div>
+                                <div class="zone-temp">${fan.speed} RPM</div>
+                            `;
+                            fansList.appendChild(fanItem);
+                        });
+                    }
+                }
             }
 
             async startMonitoring() {
@@ -802,10 +950,11 @@ HTML_TEMPLATE = '''
                     updateInProgress = true;
                     
                     try {
-                        const [temp, stats, allTemps] = await Promise.all([
+                        const [temp, stats, allTemps, fanSpeeds] = await Promise.all([
                             this.readTemperature(),
                             this.readStats(),
-                            this.readAllTemperatures()
+                            this.readAllTemperatures(),
+                            this.readFanSpeeds()
                         ]);
                         
                         if (temp !== null) {
@@ -814,7 +963,7 @@ HTML_TEMPLATE = '''
                                 this.tempHistory.shift();
                             }
                             
-                            this.updateDisplay(temp, stats, allTemps);
+                            this.updateDisplay(temp, stats, allTemps, fanSpeeds);
                             this.updateChart();
                         }
                         
@@ -845,6 +994,7 @@ if __name__ == '__main__':
     print("Enhanced CPU Temperature Monitor Backend")
     print("=" * 40)
     print(f"Thermal zones discovered: {len(thermal_monitor.thermal_zones)}")
+    print(f"Fan sensors discovered: {len(thermal_monitor.fan_sensors)}")
     print("\nStarting Flask server...")
     print("Access the monitor at: http://localhost:5000")
     print("API endpoints:")
@@ -852,6 +1002,8 @@ if __name__ == '__main__':
     print("  - /api/stats - Temperature statistics")
     print("  - /api/all-temperatures - All thermal zones")
     print("  - /api/zones - Thermal zone information")
+    print("  - /api/fans - Current fan speeds")
+    print("  - /api/fan-sensors - Fan sensor information")
     print("\nPress Ctrl+C to stop")
     
     app.run(host='0.0.0.0', port=5000, debug=True)
